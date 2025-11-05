@@ -1,189 +1,219 @@
+import { PrismaAdapter } from "@next-auth/prisma-adapter";
 import GoogleProvider from "next-auth/providers/google";
 import CredentialsProvider from "next-auth/providers/credentials";
-import prisma from "@/lib/prisma";
+import type { NextAuthOptions } from "next-auth";
+import { UserType } from "@prisma/client";
 import { comparePassword } from "@/utils/basicUtility/comparePassword";
-import NextAuth, { NextAuthOptions } from "next-auth";
+
+// A robust way to ensure the prisma client is always available
+import prisma from "@/lib/prisma";
+
+const CustomAdapter = {
+  ...PrismaAdapter(prisma),
+  createUser: async (data: any) => {
+    const { emailVerified, ...rest } = data;
+    const newUser = await prisma.user.create({ data: rest });
+    
+    // Create corresponding Student or Teacher profile for new users
+    if (newUser.userType === "STUDENT") {
+      await prisma.student.create({
+        data: {
+          userId: newUser.id,
+          section: "A",
+          year: new Date().getFullYear(),
+          batch: "2024-28",
+          department: "Computer Science",
+          rollNumber: `STU${Date.now()}`,
+        },
+      });
+    } else if (newUser.userType === "TEACHER") {
+      await prisma.teacher.create({
+        data: {
+          userId: newUser.id,
+          affiliation: "University of Engineering & Management",
+          designation: "Assistant Professor",
+          subjectOfInterest: null,
+          officialMail: newUser.email,
+          address: null,
+        },
+      });
+    }
+    
+    return newUser;
+  }
+};
+
 
 export const authOptions: NextAuthOptions = {
+  adapter: CustomAdapter,
   providers: [
-    // Credentials Provider
+    GoogleProvider({
+      clientId: process.env.GOOGLE_CLIENT_ID!,
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
+      profile(profile) {
+        return {
+          id: profile.sub,
+          email: profile.email,
+          fullName: profile.name,
+          image: profile.picture,
+          userType: "STUDENT",
+          isVerified: true,
+        };
+      },
+    }),
     CredentialsProvider({
       name: "Credentials",
       credentials: {
         email: { label: "Email", type: "email" },
         password: { label: "Password", type: "password" },
       },
-    async authorize(credentials) {
-  if (!credentials?.email || !credentials.password) return null;
-
-  const user = await prisma.user.findUnique({
-    where: { email: credentials.email },
-  });
-
-  if (!user || !user.password) return null;
-
-  const isValid = await comparePassword(
-    credentials.password,
-    user.password
-  );
-  if (!isValid || !user.isVerified) return null;
-
-  const userDetails = await prisma.userDetails.findUnique({
-    where: { email: credentials.email },
-  });
-
-  // Update userType if not already set or differs
-  if (userDetails && user.userType !== userDetails.userType) {
-    await prisma.user.update({
-      where: { email: credentials.email },
-      data: {
-        userType: userDetails.userType,
-      },
-    });
-  }
-
-  return {
-    id: user.id,
-    email: user.email,
-    userType: userDetails?.userType || user.userType || "STUDENT",
-    name: user.name,
-    image: undefined, // no image for credentials login
-  };
-}
-
-    }),
-
-    // Google Provider
-    GoogleProvider({
-      clientId: process.env.GOOGLE_CLIENT_ID!,
-      clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
-      authorization: {
-        params: {
-          prompt: "consent",
-          access_type: "offline",
-          response_type: "code"
+      async authorize(credentials) {
+        if (!credentials?.email || !credentials?.password) {
+          throw new Error("Email and password are required");
         }
-      }
+
+        const user = await prisma.user.findUnique({
+          where: { email: credentials.email },
+        });
+
+        if (!user || !(await comparePassword(credentials.password, user.password!))) {
+          throw new Error("Invalid credentials");
+        }
+
+        const legacyUser = await prisma.legacyUser.findUnique({
+          where: { email: credentials.email },
+        });
+
+        const updatedUser = await prisma.user.update({
+          where: { id: user.id },
+          data: { userType: legacyUser?.userType ?? "STUDENT" }, // Default to STUDENT if not in legacy
+        });
+
+        // Check and create Student/Teacher profile if it doesn't exist
+        if (updatedUser.userType === "STUDENT") {
+          const studentProfile = await prisma.student.findUnique({ where: { userId: updatedUser.id } });
+          if (!studentProfile) {
+            await prisma.student.create({
+              data: {
+                userId: updatedUser.id,
+                section: "A",
+                year: new Date().getFullYear(),
+                batch: "2024-28",
+                department: "Computer Science",
+                rollNumber: `STU${Date.now()}`,
+              },
+            });
+          }
+        } else if (updatedUser.userType === "TEACHER") {
+          const teacherProfile = await prisma.teacher.findUnique({ where: { userId: updatedUser.id } });
+          if (!teacherProfile) {
+            await prisma.teacher.create({
+              data: {
+                userId: updatedUser.id,
+                affiliation: "University of Engineering & Management",
+                designation: "Assistant Professor",
+                subjectOfInterest: null,
+                officialMail: updatedUser.email,
+                address: null,
+              },
+            });
+          }
+        }
+
+        return {
+          id: updatedUser.id,
+          fullName: updatedUser.fullName,
+          email: updatedUser.email ?? "",
+          image: updatedUser.image ?? "",
+          userType: updatedUser.userType,
+        };
+      },
     }),
   ],
-
-  session: {
-    strategy: "jwt",
-    maxAge: 30 * 24 * 60 * 60,
-  },
-
-  debug: process.env.NODE_ENV === "development",
-
+  session: { strategy: "jwt" },
   callbacks: {
-    async jwt({ token, user, account }) {
-      try {
-        // Handle Google login first time
-   if (user && account?.provider === "google") {
-  if (!user.email) throw new Error("No email from Google");
+    async signIn({ user, account }) {
+      if (account?.provider === "google" && user.email) {
+        const existingUser = await prisma.user.findUnique({ where: { email: user.email } });
+        
+        if (existingUser) {
+          const legacyUser = await prisma.legacyUser.findUnique({ where: { email: user.email } });
+          const newRole = legacyUser?.userType ?? existingUser.userType ?? "STUDENT"; // Default to STUDENT if not in legacy
+          const fullName = legacyUser?.fullName ?? existingUser.fullName ?? user.fullName ?? "Default-name";
 
-  let existingUser = await prisma.user.findUnique({
-    where: { email: user.email },
-  });
-
-  const userDetails = await prisma.userDetails.findUnique({
-    where: { email: user.email },
-  });
-
-  const userType = userDetails?.userType || "STUDENT";
-
-  if (!existingUser) {
-    // Create new user with default or fetched userType
-    const newUser = await prisma.user.create({
-      data: {
-        email: user.email,
-        name: user.name?.toLowerCase().trim() || "Unnamed",
-        userType,
-        isVerified: true,
-        profileImage: user.image || null,
-      },
-    });
-    existingUser = newUser;
-  } else {
-    // Update profile image if changed
-    if (user.image && user.image !== existingUser.profileImage) {
-      await prisma.user.update({
-        where: { id: existingUser.id },
-        data: { profileImage: user.image },
-      });
-    }
-
-    // Update userType if needed
-    if (userDetails && existingUser.userType !== userDetails.userType) {
-      await prisma.user.update({
-        where: { id: existingUser.id },
-        data: { userType: userDetails.userType },
-      });
-    }
-  }
-
-  // Assign to token
-  token.id = existingUser.id;
-  token.email = existingUser.email;
-  token.name = existingUser.name;
-  token.userType = existingUser.userType;
-  token.image = user.image || undefined;
-}
-
-        // Credentials login
-        if (user && account?.provider === "credentials") {
-          token.id = user.id;
-          token.email = user.email;
-          token.userType = (user as any).userType; // Cast user to any to access userType
-          token.name = user.name;
-          token.image = undefined; // Set image to undefined for credentials login in JWT token
-        }
-
-        return token;
-      } catch (error) {
-        console.error('JWT callback error:', error);
-        return token;
-      }
-    },
-
-    async session({ session, token }) {
-      try {
-        return {
-          ...session,
-          user: {
-            id: token.id as string,
-            email: token.email as string,
-            name: token.name as string,
-            userType: token.userType as string,
-            image: token.image, // Map image from token to session. Can be string or undefined.
-          },
-        };
-      } catch (error) {
-        console.error('Session callback error:', error);
-        return session;
-      }
-    },
-
-    async signIn({ user, account, profile }) {
-      try {
-        if (account?.provider === "google") {
-          // Ensure user has email from Google
-          if (!user.email) {
-            return false;
+          if (newRole !== existingUser.userType) {
+            await prisma.user.update({
+              where: { id: existingUser.id },
+              data: { userType: newRole, fullName: fullName },
+            });
           }
-          return true;
+
+          // Check and create Student/Teacher profile if it doesn't exist
+          if (newRole === "STUDENT") {
+            const studentProfile = await prisma.student.findUnique({ where: { userId: existingUser.id } });
+            if (!studentProfile) {
+              await prisma.student.create({
+                data: {
+                  userId: existingUser.id,
+                  section: "A",
+                  year: new Date().getFullYear(),
+                  batch: "2024-28",
+                  department: "Computer Science",
+                  rollNumber: `STU${Date.now()}`,
+                },
+              });
+            }
+          } else if (newRole === "TEACHER") {
+            const teacherProfile = await prisma.teacher.findUnique({ where: { userId: existingUser.id } });
+            if (!teacherProfile) {
+              await prisma.teacher.create({
+                data: {
+                  userId: existingUser.id,
+                  affiliation: "University of Engineering & Management",
+                  designation: "Assistant Professor",
+                  subjectOfInterest: null,
+                  officialMail: user.email,
+                  address: null,
+                },
+              });
+            }
+          }
+
+          user.userType = newRole;
+          user.id = existingUser.id; // Ensure the user object has the correct DB id
+        } else {
+          // This block runs for brand new Google sign-ins.
+          // Check if email exists in LegacyUser (TEACHER/ADMIN) or default to STUDENT
+          const legacyUser = await prisma.legacyUser.findUnique({ where: { email: user.email } });
+          user.userType = legacyUser?.userType ?? "STUDENT";
+          // We can't access user.id here yet, it's created later.
+          // The adapter's createUser will handle the initial creation with this user object.
         }
-        return true;
-      } catch (error) {
-        console.error('SignIn callback error:', error);
-        return false;
       }
+      return true;
+    },
+    async jwt({ token, user, account, profile }) {
+      if (user) {
+        token.id = user.id;
+        token.fullName = user.fullName;
+        token.email = user.email;
+        token.userType = (user as any).userType; // Cast to 'any' to access userType
+        token.image = user.image;
+      }
+      return token;
+    },
+    async session({ session, token }) {
+      if (session.user) {
+        session.user.id = token.id as string;
+        session.user.fullName = token.fullName as string;
+        session.user.email = token.email as string;
+        session.user.userType = token.userType as UserType;
+        session.user.image = token.image as string;
+      }
+      return session;
     },
   },
-
   pages: {
-    signIn: "/signup",
-    error: "/auth/error",
+    signIn: "/signin",
   },
-
-  secret: process.env.NEXTAUTH_SECRET,
 };
